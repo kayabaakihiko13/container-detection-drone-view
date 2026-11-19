@@ -1,24 +1,8 @@
-#!/usr/bin/env python3
-"""
-YOLO Tracking + ALIKED/LightGlue panorama stitching.
-
-Tujuan:
-- YOLO + ByteTrack mengelompokkan crop berdasarkan track_id.
-- Crop dipertahankan dalam urutan frame video.
-- ALIKED + LightGlue mencocokkan crop yang berurutan.
-- Transformasi yang gagal divalidasi akan DITOLAK (tidak ada fallback shift).
-- Setiap track menghasilkan satu panorama.
-- Pemrosesan panorama dilakukan bertahap agar penggunaan RAM lebih terkendali.
-
-Catatan:
-track_id yang salah menggabungkan dua kontainer tetap dapat menghasilkan panorama
-campuran. Periksa folder _crops dan _debug_matches untuk memvalidasi track.
-"""
-
 import argparse
 import csv
 import gc
 import json
+import math
 import random
 import sys
 import time
@@ -203,6 +187,8 @@ def parse_args():
     p.add_argument("--imgsz", type=int, default=None)
     p.add_argument("--vid-stride", type=int, default=None)
     p.add_argument("--max-crops", type=int, default=None)
+    p.add_argument("--min-crops-per-track", type=int, default=25,
+                   help="Track dengan crop kurang dari nilai ini dilewati; default 25.")
     p.add_argument("--min-track-len", type=int, default=None)
 
     p.add_argument("--crop-pad", type=float, default=None)
@@ -248,20 +234,29 @@ def resize_longest(image, max_dim):
     )
 
 
-def make_crop(frame, box, pad_ratio, max_dim):
+def make_crop(frame, box, pad_ratio, max_dim, return_bounds=False):
+    """Crop YOLO box and optionally return crop bounds in original video pixels."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = map(int, box)
     bw, bh = x2 - x1, y2 - y1
     if bw <= 1 or bh <= 1:
-        return None
+        return (None, None) if return_bounds else None
 
     px = int(round(bw * pad_ratio))
     py = int(round(bh * pad_ratio))
     xa, ya = max(0, x1 - px), max(0, y1 - py)
     xb, yb = min(w, x2 + px), min(h, y2 + py)
     if xb <= xa or yb <= ya:
-        return None
-    return resize_longest(frame[ya:yb, xa:xb].copy(), max_dim)
+        return (None, None) if return_bounds else None
+
+    crop = resize_longest(frame[ya:yb, xa:xb].copy(), max_dim)
+    bounds = {
+        "x": int(xa),
+        "y": int(ya),
+        "width": int(xb - xa),
+        "height": int(yb - ya),
+    }
+    return (crop, bounds) if return_bounds else crop
 
 
 def valid_crop(image, min_size, min_blur):
@@ -468,40 +463,42 @@ def build_transforms(images, extractor, matcher, device, args, debug_dir, track_
     return [(i, transforms[i]) for i in sorted(accepted)], pair_metrics
 
 
-def render_panorama(images, registered, max_mp):
+def render_panorama(images, registered, max_mp, source_frames=None):
+    """
+    Render one panorama and estimate ONE container bounding box in panorama space.
+
+    Each original YOLO detection bbox is converted from original-frame pixels
+    into its resized crop coordinates, projected through the accumulated
+    stitching transform, and then robustly aggregated into one container bbox.
+    """
     if not registered:
-        return None
+        return None, None, 0
 
     all_corners = []
     for index, transform in registered:
         projected = cv2.perspectiveTransform(corners_of(images[index]), transform)
+        if not np.isfinite(projected).all():
+            return None, None, 0
         all_corners.append(projected.reshape(-1, 2))
 
     points = np.concatenate(all_corners, axis=0)
-    if not np.isfinite(points).all():
-        return None
-
     min_x = int(np.floor(points[:, 0].min()))
     min_y = int(np.floor(points[:, 1].min()))
     max_x = int(np.ceil(points[:, 0].max()))
     max_y = int(np.ceil(points[:, 1].max()))
-
-    width = max_x - min_x
-    height = max_y - min_y
+    width, height = max_x - min_x, max_y - min_y
     if width <= 0 or height <= 0:
-        return None
+        return None, None, 0
 
     scale = min(1.0, np.sqrt((max_mp * 1_000_000) / float(width * height)))
     out_w = max(1, int(round(width * scale)))
     out_h = max(1, int(round(height * scale)))
-
     shift = np.array([
         [scale, 0, -min_x * scale],
         [0, scale, -min_y * scale],
         [0, 0, 1],
     ], dtype=np.float64)
 
-    # Akumulasi bertahap; tidak menyimpan seluruh warped image di RAM.
     accumulator = np.zeros((out_h, out_w, 3), dtype=np.float32)
     weight_sum = np.zeros((out_h, out_w), dtype=np.float32)
 
@@ -520,18 +517,90 @@ def render_panorama(images, registered, max_mp):
         del warped, mask, mask_src, weight
 
     panorama = np.divide(
-        accumulator,
-        np.maximum(weight_sum[..., None], 1e-5)
+        accumulator, np.maximum(weight_sum[..., None], 1e-5)
     ).clip(0, 255).astype(np.uint8)
 
     occupied = np.where(weight_sum > 0.02)
     if len(occupied[0]) == 0:
-        return None
-    panorama = panorama[
-        occupied[0].min():occupied[0].max() + 1,
-        occupied[1].min():occupied[1].max() + 1
-    ]
-    return panorama
+        return None, None, 0
+    crop_y1, crop_y2 = int(occupied[0].min()), int(occupied[0].max() + 1)
+    crop_x1, crop_x2 = int(occupied[1].min()), int(occupied[1].max() + 1)
+    panorama = panorama[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    crop_shift = np.array([
+        [1, 0, -crop_x1],
+        [0, 1, -crop_y1],
+        [0, 0, 1],
+    ], dtype=np.float64)
+    final_panorama_size = (int(panorama.shape[1]), int(panorama.shape[0]))
+
+    # One projected YOLO detection rectangle per registered source crop.
+    projected_detection_boxes = []
+    for index, transform in registered:
+        if source_frames is None or index >= len(source_frames):
+            continue
+        source_info = source_frames[index]
+        detection = source_info.get("video_detection_bbox")
+        crop_bounds = source_info.get("video_crop_bbox")
+        if not detection or not crop_bounds:
+            continue
+
+        crop_w_original = max(1.0, float(crop_bounds["width"]))
+        crop_h_original = max(1.0, float(crop_bounds["height"]))
+        crop_h_resized, crop_w_resized = images[index].shape[:2]
+
+        # Convert original-video bbox coordinates into the resized crop coordinates.
+        sx = crop_w_resized / crop_w_original
+        sy = crop_h_resized / crop_h_original
+        dx1 = (float(detection["x"]) - float(crop_bounds["x"])) * sx
+        dy1 = (float(detection["y"]) - float(crop_bounds["y"])) * sy
+        dx2 = (float(detection["x"]) + float(detection["width"]) -
+               float(crop_bounds["x"])) * sx
+        dy2 = (float(detection["y"]) + float(detection["height"]) -
+               float(crop_bounds["y"])) * sy
+
+        detection_corners = np.float32([
+            [dx1, dy1], [dx2, dy1], [dx2, dy2], [dx1, dy2]
+        ]).reshape(-1, 1, 2)
+
+        final_transform = crop_shift @ shift @ transform
+        projected = cv2.perspectiveTransform(detection_corners, final_transform)
+        if not np.isfinite(projected).all():
+            continue
+
+        xy = projected.reshape(-1, 2)
+        x1 = float(np.clip(xy[:, 0].min(), 0, final_panorama_size[0]))
+        y1 = float(np.clip(xy[:, 1].min(), 0, final_panorama_size[1]))
+        x2 = float(np.clip(xy[:, 0].max(), 0, final_panorama_size[0]))
+        y2 = float(np.clip(xy[:, 1].max(), 0, final_panorama_size[1]))
+        if x2 > x1 and y2 > y1:
+            projected_detection_boxes.append([x1, y1, x2, y2])
+
+    container_bbox = None
+    if projected_detection_boxes:
+        boxes = np.asarray(projected_detection_boxes, dtype=np.float64)
+
+        # Union all projected per-frame container detections into ONE bbox.
+        # x/y = top-left of the union; right/bottom = farthest extent.
+        left = float(np.min(boxes[:, 0]))
+        top = float(np.min(boxes[:, 1]))
+        right = float(np.max(boxes[:, 2]))
+        bottom = float(np.max(boxes[:, 3]))
+
+        x1 = max(0, int(np.floor(left)))
+        y1 = max(0, int(np.floor(top)))
+        x2 = min(final_panorama_size[0], int(np.ceil(right)))
+        y2 = min(final_panorama_size[1], int(np.ceil(bottom)))
+
+        if x2 > x1 and y2 > y1:
+            container_bbox = {
+                "x": x1,
+                "y": y1,
+                "width": x2 - x1,
+                "height": y2 - y1,
+            }
+
+    return panorama, container_bbox, len(projected_detection_boxes)
 
 
 def main():
@@ -620,23 +689,46 @@ def main():
             x1, y1, x2, y2 = box
             track_stats[track_id]["box_areas"].append(float(max(0, x2-x1) * max(0, y2-y1)))
             frame_confidences.append(float(confidence) if np.isfinite(confidence) else None)
-            crop = make_crop(frame, box, args.crop_pad, args.max_crop_dim)
+            crop, crop_bounds = make_crop(
+                frame, box, args.crop_pad, args.max_crop_dim, return_bounds=True
+            )
             if not valid_crop(crop, args.min_crop_size, args.min_crop_blur):
                 rejected_crops += 1
                 continue
+
+            # processed is the 1-based index in the stride-sampled inference stream.
+            # Map it back to the decoded source video's frame index.
+            source_video_frame_0based = max(0, (processed - 1) * args.vid_stride)
+            source_video_frame_1based = source_video_frame_0based + 1
+            x1, y1, x2, y2 = [float(v) for v in box]
+            frame_coordinate_info = {
+                "processed_frame_index": int(processed),
+                "source_video_frame_0based": int(source_video_frame_0based),
+                "source_video_frame_1based": int(source_video_frame_1based),
+                "video_detection_bbox": {
+                    "x": round(x1, 2),
+                    "y": round(y1, 2),
+                    "width": round(max(0.0, x2 - x1), 2),
+                    "height": round(max(0.0, y2 - y1), 2),
+                },
+                "video_crop_bbox": crop_bounds,
+                "video_frame_size": {
+                    "width": int(frame.shape[1]),
+                    "height": int(frame.shape[0]),
+                },
+            }
 
             entries = tracks.setdefault(track_id, [])
             seen = track_seen.get(track_id, 0) + 1
             track_seen[track_id] = seen
 
-            # Reservoir sampling: batas RAM berlaku saat video dibaca.
-            # Setelah video selesai, crop terpilih diurutkan berdasarkan frame.
+            # Reservoir sampling: each crop keeps its own video-frame coordinates.
             if len(entries) < args.max_crops:
-                entries.append((processed, crop))
+                entries.append((processed, crop, frame_coordinate_info))
             else:
                 replacement = random.randrange(seen)
                 if replacement < args.max_crops:
-                    entries[replacement] = (processed, crop)
+                    entries[replacement] = (processed, crop, frame_coordinate_info)
             del crop
 
         valid_frame_conf = [v for v in frame_confidences if v is not None]
@@ -698,7 +790,7 @@ def main():
         for track_id, entries in tracks.items():
             track_folder = crop_dir / f"track_{track_id:04d}"
             track_folder.mkdir(exist_ok=True)
-            for frame_number, image in entries:
+            for frame_number, image, _frame_coordinates in entries:
                 cv2.imwrite(
                     str(track_folder / f"frame_{frame_number:06d}.jpg"),
                     image, [cv2.IMWRITE_JPEG_QUALITY, 92]
@@ -708,21 +800,38 @@ def main():
     extractor = ALIKED(max_num_keypoints=args.keypoints).eval().to(device)
     matcher = LightGlue(features="aliked").eval().to(device)
 
-    valid_tracks = [
-        (track_id, entries)
-        for track_id, entries in tracks.items()
-        if len(entries) >= args.min_track_len
-    ]
+    crop_count_skips = []
+    valid_tracks = []
+    for track_id, entries in tracks.items():
+        if len(entries) < args.min_crops_per_track:
+            crop_count_skips.append({
+                "track_id": int(track_id),
+                "crop_count": int(len(entries)),
+                "required_minimum": int(args.min_crops_per_track),
+                "reason": "insufficient_crop_count",
+            })
+            print(
+                f"   [SKIP CROP COUNT] track {track_id}: "
+                f"{len(entries)} crop < {args.min_crops_per_track}"
+            )
+            continue
+        if len(entries) < args.min_track_len:
+            continue
+        valid_tracks.append((track_id, entries))
 
-    print(f"3. Stitching ALIKED + LightGlue: {len(valid_tracks)} track")
+    print(
+        f"3. Stitching ALIKED + LightGlue: {len(valid_tracks)} track "
+        f"(minimum {args.min_crops_per_track} crop/track)"
+    )
     saved = failed = 0
 
     for number, (track_id, entries) in enumerate(
         tqdm(valid_tracks, desc="Stitching", unit="track"), start=1
     ):
         output_path = out_dir / f"container_{track_id:04d}.jpg"
-        images = [image for _, image in entries]
-        images = choose_ordered_samples(images, args.max_stitch_frames)
+        selected_entries = choose_ordered_samples(entries, args.max_stitch_frames)
+        source_frame_coordinates = [item[2] for item in selected_entries]
+        images = [item[1] for item in selected_entries]
 
         print(
             f"\n[{number}/{len(valid_tracks)}] Track {track_id}: "
@@ -743,11 +852,26 @@ def main():
                 failed += 1
                 continue
 
-            panorama = render_panorama(images, registered, args.max_pano_mp)
+            panorama, container_bbox, bbox_samples = render_panorama(
+                images, registered, args.max_pano_mp,
+                source_frames=source_frame_coordinates,
+            )
             if panorama is None or panorama.size == 0:
                 print("   [FAIL] Panorama kosong")
                 error_rows.append({"stage": "rendering", "track_id": int(track_id), "pair_index": None,
                                    "error_type": "empty_panorama", "message": "render_panorama returned empty result"})
+                failed += 1
+                continue
+
+            if container_bbox is None:
+                print("   [SKIP] Bounding box kontainer tidak dapat diproyeksikan ke panorama")
+                error_rows.append({
+                    "stage": "container_bbox",
+                    "track_id": int(track_id),
+                    "pair_index": None,
+                    "error_type": "container_bbox_projection_failed",
+                    "message": "No valid projected YOLO detection boxes in panorama coordinates.",
+                })
                 failed += 1
                 continue
 
@@ -765,8 +889,12 @@ def main():
             file_size_bytes = output_path.stat().st_size if output_path.exists() else None
             panorama_rows.append({
                 "track_id": int(track_id),
+                "first_frame": int(entries[0][0]),
+                "last_frame": int(entries[-1][0]),
                 "input_crops": len(images),
                 "registered_crops": len(registered),
+                "container_bbox": container_bbox,
+                "bbox_samples": int(bbox_samples),
                 "registration_coverage": len(registered) / max(1, len(images)),
                 "width_px": int(panorama.shape[1]),
                 "height_px": int(panorama.shape[0]),
@@ -817,6 +945,7 @@ def main():
         "input_video": str(source),
         "model": str(model_path),
         "profile": args.profile,
+        "minimum_crops_per_track": int(args.min_crops_per_track),
         "parameters": {k: v for k, v in vars(args).items() if k not in {"source", "model", "output_dir"}},
         "tracking": {
             "processed_frames": processed,
@@ -824,6 +953,7 @@ def main():
             "tracked_detections": total_tracked_detections,
             "unique_track_ids": len(track_rows),
             "rejected_crops": rejected_crops,
+            "tracks_skipped_low_crop_count": len(crop_count_skips),
             "mean_track_confidence": safe_mean([r["mean_confidence"] for r in track_rows]),
             "mean_track_continuity_proxy": safe_mean([r["continuity_proxy"] for r in track_rows]),
             "total_fragmentation_proxy": int(sum(r["fragmentation_proxy"] for r in track_rows)),
@@ -858,6 +988,63 @@ def main():
         },
         "errors_count": len(error_rows),
     }
+    write_csv(out_dir / "crop_count_skips.csv", crop_count_skips,
+              ["track_id", "crop_count", "required_minimum", "reason"])
+    # Arrange each panorama on a virtual grid in source-video appearance order.
+    # x/y are positions on the shared layout canvas; width/height are the
+    # actual dimensions of each saved panorama (not fixed 4000x4000 cells).
+    ordered_panorama_rows = sorted(
+        panorama_rows,
+        key=lambda row: (row.get("first_frame", 0), row.get("track_id", 0)),
+    )
+
+    container_coordinate_rows = []
+    container_count = len(ordered_panorama_rows)
+
+    if container_count:
+        grid_columns = int(math.ceil(math.sqrt(container_count)))
+        grid_rows = int(math.ceil(container_count / grid_columns))
+
+        # Equal grid slots prevent overlap while allowing each panorama
+        # to retain its native aspect ratio and pixel dimensions.
+        cell_width = max(int(row["width_px"]) for row in ordered_panorama_rows)
+        cell_height = max(int(row["height_px"]) for row in ordered_panorama_rows)
+
+        for index, panorama_row in enumerate(ordered_panorama_rows):
+            row_index = index // grid_columns
+            column_index = index % grid_columns
+
+            pano_width = int(panorama_row["width_px"])
+            pano_height = int(panorama_row["height_px"])
+
+            container_coordinate_rows.append({
+                "container_id": int(panorama_row["track_id"]),
+                "container_file": panorama_row["output_file"],
+                "x": int(column_index * cell_width),
+                "y": int(row_index * cell_height),
+                "width": pano_width,
+                "height": pano_height,
+            })
+
+        layout_canvas_width = int(grid_columns * cell_width)
+        layout_canvas_height = int(grid_rows * cell_height)
+    else:
+        grid_columns = grid_rows = 0
+        layout_canvas_width = layout_canvas_height = 0
+
+    coordinate_document = {
+        "canvas_width": layout_canvas_width,
+        "canvas_height": layout_canvas_height,
+        "containers": container_coordinate_rows,
+    }
+    with (out_dir / "container_coordinates.json").open("w", encoding="utf-8") as jf:
+        json.dump(coordinate_document, jf, indent=2, ensure_ascii=False)
+
+    write_csv(
+        out_dir / "container_coordinates.csv",
+        container_coordinate_rows,
+        ["container_id", "container_file", "x", "y", "width", "height"],
+    )
     export_analytics(out_dir, summary, frame_rows, track_rows, match_rows, panorama_rows, error_rows, stage_rows)
 
 
