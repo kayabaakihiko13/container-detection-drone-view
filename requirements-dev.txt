@@ -1,0 +1,19 @@
+# Python 3.11 — environment development proyek drone
+# Core: trainer/train.py + pipeline_yolo_paronama.py
+ultralytics==8.4.184
+torch==2.11.0
+torchvision==0.26.0
+numpy==2.3.5
+opencv-python==4.10.0.84
+lap==0.5.14
+
+# Panorama: ALIKED + LightGlue
+lightglue @ git+https://github.com/cvg/LightGlue.git@5a650c444718caffc2669dc0094cde908f42dd73
+kornia==0.9.0
+tqdm==4.70.1
+matplotlib==3.11.2
+
+# Export ONNX: trainer/export.py
+onnx==1.23.2
+onnxruntime==1.31.0
+onnxslim==0.1.98

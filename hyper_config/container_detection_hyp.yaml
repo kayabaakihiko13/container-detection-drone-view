@@ -1,0 +1,51 @@
+# =====================================================================
+# Hyperparameter & Data Augmentation Configuration for YOLO
+# Disesuaikan khusus untuk deteksi objek tampak atas / drone (container_top)
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 1. OPTIMIZER & LEARNING RATE
+# ---------------------------------------------------------------------
+optimizer: auto          # Pilihan: 'auto', 'SGD', 'Adam', 'AdamW'. 'auto' memilih optimizer terbaik otomatis.
+lr0: 0.01                # Initial learning rate (misal: 0.01 untuk SGD, 0.001 untuk AdamW)
+lrf: 0.01                # Final learning rate fraction (lr0 * lrf)
+momentum: 0.937          # Momentum untuk SGD / beta1 untuk Adam
+weight_decay: 0.0005     # L2 regularization weight decay
+warmup_epochs: 3.0       # Epoch pemanasan awal (warmup)
+warmup_momentum: 0.8     # Momentum awal saat warmup
+warmup_bias_lr: 0.1      # Bias learning rate saat warmup
+cos_lr: true             # Gunakan Cosine Annealing Learning Rate scheduler untuk konvergensi lebih halus
+
+# ---------------------------------------------------------------------
+# 2. LOSS GAINS
+# ---------------------------------------------------------------------
+box: 7.5                 # Bobot loss bounding box (koordinat)
+cls: 0.5                 # Bobot loss klasifikasi
+dfl: 1.5                 # Bobot loss distribution focal loss
+
+# ---------------------------------------------------------------------
+# 3. DATA AUGMENTATION (Optimal untuk Drone / Aerial Imagery)
+# ---------------------------------------------------------------------
+# Drone dapat melihat objek dari sudut pandang dan orientasi mana saja,
+# sehingga rotasi dan flip vertikal sangat dianjurkan.
+
+degrees: 25.0            # Rotasi gambar (+/- derajat). Sangat cocok untuk sudut drone dinamis
+translate: 0.1           # Translasi / pergeseran horizontal & vertikal (+/- fraksi)
+scale: 0.5               # Skala pembesaran/pengecilan (+/- fraksi), mensimulasikan ketinggian terbang drone
+shear: 2.0               # Efek shear (+/- derajat), mensimulasikan sudut kamera miring
+perspective: 0.0002      # Distorsi perspektif lensa
+
+# Flip
+fliplr: 0.5              # Probabilitas flip horizontal (kiri-kanan): 50%
+flipud: 0.5              # Probabilitas flip vertikal (atas-bawah): 50% (PENTING untuk tampak atas drone)
+
+# Color & Lighting (Menyesuaikan kondisi cuaca / terik matahari / bayangan)
+hsv_h: 0.015             # Variasi hue warna
+hsv_s: 0.7               # Variasi saturasi warna
+hsv_v: 0.4               # Variasi kecerahan / exposure
+
+# Advanced Augmentations
+mosaic: 1.0              # Probabilitas mosaic (menggabungkan 4 gambar): 100%
+close_mosaic: 10         # Matikan mosaic di 10 epoch terakhir agar model fokus pada gambar asli utuh
+mixup: 0.1               # Probabilitas mixup (blending 2 gambar): 10%
+erasing: 0.2             # Random erasing probability (mensimulasikan oklusi sebagian kontainer)

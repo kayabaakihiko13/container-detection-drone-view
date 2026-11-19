@@ -1,0 +1,8 @@
+# Custom ByteTrack Configuration for Drone Top-Down Tracking
+tracker_type: bytetrack
+track_high_thresh: 0.2     # Ambang match tahap 1 (Solusi B: lebih sensitif)
+track_low_thresh: 0.05     # Ambang match tahap 2 untuk deteksi samar
+new_track_thresh: 0.2      # Ambang inisiasi track baru
+track_buffer: 60           # Solusi A: Diperpanjang ke 90 frame (~3 detik pada 30 fps)
+match_thresh: 0.75         # Toleransi asosiasi IoU terhadap gerakan kamera drone
+fuse_score: True           # Menggabungkan skor deteksi dengan motion/IoU
