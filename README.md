@@ -1,18 +1,19 @@
-# Drone Container Detection
+# Image Stitching App — Drone Container Detection
 
-Proyek deteksi kontainer dari citra drone menggunakan YOLO (Ultralytics), object tracking,
-panorama stitching ALIKED + LightGlue, dan export model ONNX untuk deployment CPU.
+Proyek deteksi kontainer dari video drone menggunakan YOLO (Ultralytics) + ByteTrack,
+lalu menyusun crop per `track_id` menjadi panorama dengan ALIKED + LightGlue.
+Tersedia juga script training, export model ke ONNX (CPU/FP32), dan konfigurasi
+hyperparameter/tracker khusus citra drone.
 
 ## Lingkungan
 
 - Python 3.11 (disarankan)
 - Windows / PowerShell
-- Default instalasi memakai PyTorch CPU
-- GPU NVIDIA opsional (lihat bagian [GPU opsional](#gpu-opsional))
+- CPU-only: aplikasi berjalan sepenuhnya di CPU tanpa GPU
 
 ## Instalasi
 
-Jalankan dari root proyek `D:\Dataset\Kerja\Drone`.
+Jalankan dari root proyek `D:\Kerja\image_stitching_app`.
 
 ```powershell
 python -m venv .venv
@@ -34,24 +35,12 @@ membutuhkan koneksi internet dan `git`. Untuk instalasi offline, gunakan clone l
 pip install -e D:\Tools\LightGlue
 ```
 
-### GPU opsional
-
-Requirement default memakai PyTorch CPU (`torch.cuda.is_available()` bernilai `False`).
-Jika ingin training/inferensi di GPU, install ulang PyTorch dengan build CUDA:
-
-```powershell
-pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-```
-
-Sesuaikan `cu128` dengan versi CUDA driver yang terpasang.
-
 ### Verifikasi instalasi
 
 ```powershell
 python -c "import torch, ultralytics, cv2, numpy, lap; print('core ok', torch.__version__, cv2.__version__)"
 python -c "import lightglue, kornia, tqdm, matplotlib; print('panorama ok')"
 python -c "import onnx, onnxruntime, onnxslim; print('export ok')"
-python -c "import torch; print('cuda:', torch.cuda.is_available())"
 ```
 
 ### Membersihkan environment lama
@@ -71,39 +60,31 @@ Distribusi yang dipakai proyek ini hanya `opencv-python` dan `onnxruntime` (CPU)
 
 ```
 .
-├── dataset.yaml                     # dataset root (urutan kelas berbeda)
-├── YoloDataset/dataset.yaml         # dataset yang dipakai training labelme_yolo-2
+├── pipeline_yolo_paronama.py            # tracking YOLO + ByteTrack -> panorama ALIKED/LightGlue
+├── requirements-dev.txt
+├── hyper_config/
+│   ├── container_detection_hyp.yaml     # hyperparameter & augmentasi training (cfg)
+│   └── custom_bytetrack.yaml            # konfigurasi ByteTrack untuk citra drone
 ├── trainer/
-│   ├── train.py                     # training YOLO
-│   ├── export.py                    # export .pt -> .onnx (FP32, CPU, opset 11)
-│   ├── yaml/hyp.yaml                # hyperparameter & augmentasi
-│   ├── custom_bytetrack.yaml        # konfigurasi ByteTrack
-│   └── runs/detect/                 # output training, weights, metrik
-├── pipeline_yolo_paronama.py        # tracking + panorama ALIKED/LightGlue
-├── pipeline_hybrid_trackless.py     # pipeline panorama tanpa tracker
-├── track.py                         # tracking video ke MP4 720p
-├── split_video.py                   # pemecah video menjadi frame
-├── split_panorama.py                # pemecah panorama
-├── filter_track_ids.py              # filter hasil track JSONL
-└── requirements-dev.txt
+│   ├── train.py                         # training YOLO
+│   └── export.py                        # export .pt -> .onnx (FP32, CPU, opset 11)
+└── weight/
+    ├── best.pt                          # model YOLO hasil training
+    └── container_detection_model.onnx   # model hasil export ONNX
 ```
+
+Dataset, video input, dan output run tidak disertakan di repository.
 
 ## Dataset
 
-Gunakan `YoloDataset/dataset.yaml` untuk training dan validasi. Urutan kelasnya:
+Script training menerima path `dataset.yaml` lewat argumen `--data`. Default internal
+script menunjuk ke `..\container-top-yolo\dataset.yaml` yang tidak disertakan di repo,
+jadi selalu isi `--data` secara eksplisit.
+
+Struktur dataset yang diharapkan Ultralytics:
 
 ```
-0: container_left_right
-1: iso_code
-2: container_number
-3: container_rear_front
-4: container_top
-```
-
-Struktur folder:
-
-```
-YoloDataset/
+dataset/
 ├── dataset.yaml
 ├── images/train
 ├── images/val
@@ -111,8 +92,19 @@ YoloDataset/
 └── labels/val
 ```
 
-Perhatian: `dataset.yaml` di root memakai urutan kelas yang berbeda. Jangan mencampur
-keduanya, karena label akan terbaca dengan kelas yang salah.
+Contoh `dataset.yaml` (sesuaikan `path` dan `names` dengan anotasi):
+
+```yaml
+path: D:/path/ke/dataset
+train: images/train
+val: images/val
+
+names:
+  0: container_top
+```
+
+Urutan `names` harus sama dengan urutan kelas pada label dan dengan nilai `--classes`
+saat menjalankan pipeline panorama.
 
 ## Penggunaan
 
@@ -120,112 +112,148 @@ keduanya, karena label akan terbaca dengan kelas yang salah.
 
 ```powershell
 python trainer\train.py `
-  --data "YoloDataset\dataset.yaml" `
-  --model "yolov8m.pt" `
-  --cfg "trainer\yaml\hyp.yaml" `
+  --data "D:\path\ke\dataset\dataset.yaml" `
+  --cfg "hyper_config\container_detection_hyp.yaml" `
+  --model "yolov8n.pt" `
   --epochs 50 `
-  --imgsz 480 `
+  --imgsz 640 `
   --batch 8 `
   --device cpu `
   --project "trainer\runs\detect" `
-  --name "labelme_yolo"
+  --name "container_top_exp"
 ```
 
-- `--device 0` untuk GPU (jika PyTorch CUDA terpasang), `--device cpu` untuk CPU.
-- `--cfg` sebaiknya diisi eksplisit karena default `trainer/hyp.yaml` tidak ada;
-  file yang tersedia adalah `trainer/yaml/hyp.yaml`.
-- Output training: `trainer/runs/detect/<name>/` berisi `weights/best.pt`,
-  `results.csv`, grafik kurva, dan confusion matrix.
-
-### Validasi model
-
-```powershell
-yolo detect val `
-  model="trainer\runs\detect\labelme_yolo-2\weights\best.pt" `
-  data="YoloDataset\dataset.yaml" `
-  imgsz=480 batch=8 device=cpu `
-  project="trainer\runs\detect" name="val_best" exist_ok=True
-```
-
-Metrik utama: `metrics/mAP50(B)`, `metrics/mAP50-95(B)`, precision, dan recall.
-Metrik juga tersimpan di `trainer/runs/detect/<name>/results.csv`.
+- `--device cpu`: aplikasi ini hanya berjalan di CPU.
+- `--cfg` default mengarah ke `trainer/hyp.yaml` yang tidak ada di repo, jadi isi
+  eksplisit dengan `hyper_config\container_detection_hyp.yaml`. Jika `--cfg` tidak
+  ditemukan, training memakai default Ultralytics.
+- `--model` default `yolov8n.pt`; bisa diganti `yolov8s.pt`, `yolo11n.pt`, dan sebagainya.
+- `--resume` untuk melanjutkan training yang terputus.
+- Script otomatis menjalankan `model.val()` setelah training.
+- Output: `<project>\<name>\` berisi `weights/best.pt`, `weights/last.pt`, `results.csv`,
+  grafik kurva, dan confusion matrix.
 
 ### Export ONNX
 
 ```powershell
 python trainer\export.py `
-  -m "trainer\runs\detect\labelme_yolo-2\weights\best.pt" `
-  -o "container_detection_model.onnx" `
+  -m "weight\best.pt" `
+  -o "weight\container_detection_model.onnx" `
   --imgsz 480 480 `
-  --opset 11
+  --opset 11 `
+  --overwrite
 ```
+
+`--overwrite` diperlukan bila file output sudah ada (seperti model ONNX yang sudah
+disertakan di folder `weight/`).
 
 Karakteristik `trainer/export.py`:
 
-- Input wajib `.pt`, output `.onnx`
+- Input wajib `.pt`, output wajib `.onnx`
 - Presisi selalu FP32 (`--half` ditolak)
 - Device selalu CPU (`--device cpu`)
 - Opset default `11`
 - `--simplify` aktif secara default; gunakan `--no-simplify` untuk mematikannya
 - `--imgsz HEIGHT WIDTH` mendefinisikan bentuk input ONNX `[1, 3, H, W]`
-- Output default disimpan di folder yang sama dengan file `.pt`
+- Jika `-o` hanya berupa nama file, output disimpan di folder yang sama dengan `.pt`
+- File output yang sudah ada akan ditolak kecuali memakai `--overwrite`
 
 Contoh lain:
 
 ```powershell
 # verifikasi onnxruntime + dummy inference
-python trainer\export.py -m "...\best.pt" -o "model.onnx" --verify-infer
+python trainer\export.py -m "weight\best.pt" -o "weight\model.onnx" --verify-infer
 
 # timpa file output yang sudah ada
-python trainer\export.py -m "...\best.pt" -o "model.onnx" --overwrite
+python trainer\export.py -m "weight\best.pt" -o "weight\model.onnx" --overwrite
 
 # ukuran non-persegi (height 480, width 640)
-python trainer\export.py -m "...\best.pt" -o "model_480x640.onnx" --imgsz 480 640
+python trainer\export.py -m "weight\best.pt" -o "weight\model_480x640.onnx" --imgsz 480 640
 ```
-
-### Tracking video
-
-```powershell
-python track.py `
-  --source "DJI_0022.MP4" `
-  --model "trainer\runs\detect\labelme_yolo-2\weights\best.pt" `
-  --tracker "trainer\custom_bytetrack.yaml" `
-  --imgsz 480 `
-  --conf 0.3 `
-  --device cpu `
-  --output-dir "runs\track\DJI_0022_720p"
-```
-
-Output: video MP4 720p, `tracks.jsonl`, dan file pendukung di `--output-dir`.
-Jika `--device cpu`, inferensi lebih lambat dibanding GPU.
 
 ### Pipeline panorama
 
 ```powershell
 python pipeline_yolo_paronama.py `
   --source "DJI_0022.MP4" `
-  --model "trainer\runs\detect\labelme_yolo-2\weights\best.pt" `
+  --model "weight\best.pt" `
+  --tracker "hyper_config\custom_bytetrack.yaml" `
   --profile balanced `
-  --tracker bytetrack.yaml `
   --device cpu `
-  --classes 4
+  --classes 0
 ```
 
-- `--profile`: `hq`, `balanced`, atau `fast`.
-- `--classes 4` memilih kelas `container_top` (lihat urutan kelas `YoloDataset`).
-- `--classes 0` memilih `container_left_right`.
-- Output default: `runs/lightglue_tracking/`, berisi panorama, crop, analytics CSV,
-  `summary_report.json`, dan grafik (jika matplotlib tersedia).
-- Gunakan `--save-crops` dan `--debug-matches` untuk inspeksi hasil matching.
+Alur pemrosesan:
+
+1. YOLO + ByteTrack mendeteksi dan mengelompokkan objek berdasarkan `track_id`.
+2. Crop tiap track disimpan berurutan sesuai frame video (dibatasi reservoir sampling).
+3. ALIKED mengekstrak keypoint, LightGlue mencocokkan crop berurutan.
+4. Transformasi divalidasi RANSAC affine/homografi; pasangan yang gagal ditolak
+   (tidak ada fallback pergeseran).
+5. Setiap track dengan cukup crop valid dijahit menjadi satu panorama.
+
+Argumen penting:
+
+- `--profile`: `hq`, `balanced` (default), atau `fast`.
+- `--tracker`: default `bytetrack.yaml` bawaan Ultralytics; gunakan
+  `hyper_config\custom_bytetrack.yaml` untuk konfigurasi drone.
+- `--classes`: class ID YOLO dipisahkan koma (mis. `0` atau `0,3`), sesuai `names`
+  pada dataset.
+- `--conf`: ambang confidence deteksi (default `0.40`).
+- `--device`: gunakan `cpu`; aplikasi ini hanya berjalan di CPU.
+- `--save-crops`: simpan crop per track ke `<output-dir>\_crops`.
+- `--debug-matches`: simpan visual pasangan crop ke `<output-dir>\_debug_matches`.
+- `--seed`: seed acak (default `42`).
+
+Parameter yang bisa ditimpa manual: `--imgsz`, `--vid-stride`, `--max-crops`,
+`--min-track-len`, `--crop-pad`, `--max-crop-dim`, `--min-crop-size`,
+`--min-crop-blur`, `--max-stitch-frames`, `--keypoints`, `--min-inliers`,
+`--min-inlier-ratio`, `--ransac-thresh`, `--max-pano-mp`, `--jpeg-quality`.
+
+Profil bawaan:
+
+| Profil     | imgsz | vid_stride | max_crops | max_stitch_frames | keypoints | min_track_len |
+|------------|-------|------------|-----------|-------------------|-----------|---------------|
+| `hq`       | 1024  | 1          | 300       | 90                | 6144      | 10            |
+| `balanced` | 800   | 2          | 160       | 40                | 3072      | 8             |
+| `fast`     | 640   | 3          | 100       | 30                | 2048      | 6             |
+
+Output default di `runs/lightglue_tracking/`:
+
+- `container_<track_id>.jpg` — panorama per track
+- `frame_analytics.csv`, `track_analytics.csv`, `matching_analytics.csv`,
+  `panorama_analytics.csv`, `stage_timing.csv`, `errors.csv`
+- `summary_report.json` — ringkasan parameter, tracking, matching, stitching, sistem
+- `analytics_charts/` — grafik PNG (jika matplotlib tersedia)
+- `_crops/` dan `_debug_matches/` hanya jika argumen terkait diaktifkan
+
+## Konfigurasi tambahan
+
+### `hyper_config/container_detection_hyp.yaml`
+
+Hyperparameter dan augmentasi untuk citra drone/tampak atas:
+
+- Optimizer `auto`, `lr0=0.01`, cosine LR, warmup 3 epoch
+- Rotasi `degrees=25`, `scale=0.5`, `shear=2.0`, `perspective=0.0002`
+- Flip horizontal dan vertikal masing-masing 50%
+- Mosaic 100% (dimatikan 10 epoch terakhir), mixup 10%, erasing 20%
+
+### `hyper_config/custom_bytetrack.yaml`
+
+ByteTrack yang lebih toleran terhadap gerakan kamera drone:
+
+- `track_high_thresh=0.2`, `track_low_thresh=0.05`, `new_track_thresh=0.2`
+- `track_buffer=60`, `match_thresh=0.75`, `fuse_score=True`
 
 ## Catatan
 
-- Model `labelme_yolo-2` dilatih dengan `YoloDataset/dataset.yaml` pada `imgsz=480`.
-  Gunakan resolusi dan urutan kelas yang sama saat training, validasi, dan inferensi.
+- Gunakan resolusi dan urutan kelas yang sama saat training, export, dan inferensi.
+- Model contoh tersedia di `weight/best.pt` dan `weight/container_detection_model.onnx`.
 - `onnxruntime` versi CPU sudah cukup untuk `trainer/export.py`.
 - `lap` wajib terpasang agar ByteTrack berjalan.
 - LightGlue membutuhkan `torch`, `torchvision`, `kornia`, dan OpenCV.
-- File `test.py` kosong dan folder `tests/` masih merujuk modul yang tidak ada di repo.
+- `track_id` yang salah menggabungkan dua kontainer dapat menghasilkan panorama
+  campuran; periksa `_crops` dan `_debug_matches` untuk memvalidasi tracking.
 
 ## Troubleshooting
 
@@ -242,13 +270,18 @@ pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless
 pip install opencv-python==4.10.0.84
 ```
 
-**`torch.cuda.is_available()` bernilai False**
-Itu normal bila memakai requirement default (CPU). Untuk GPU:
+**Dataset tidak ditemukan saat training**
+Default `--data` mengarah ke folder yang tidak ada di repo. Isi eksplisit:
 ```powershell
-pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+python trainer\train.py --data "D:\path\ke\dataset\dataset.yaml"
 ```
 
 **Export gagal karena file output sudah ada**
 ```powershell
-python trainer\export.py -m "...\best.pt" -o "model.onnx" --overwrite
+python trainer\export.py -m "weight\best.pt" -o "weight\model.onnx" --overwrite
 ```
+
+**Panorama tidak terbentuk / track dilewati**
+Naikkan `--max-crops`/`--min-track-len` atau gunakan `--profile hq`, lalu periksa
+`errors.csv`, `matching_analytics.csv`, dan `_debug_matches` untuk melihat alasan
+penolakan pasangan crop.
